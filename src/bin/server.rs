@@ -1,46 +1,45 @@
-use std::arch::asm;
-use std::cell::RefCell;
-use std::error::Error;
+// Copyright 2025 CloudWeGo Authors
+// 
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// 
+//     https://www.apache.org/licenses/LICENSE-2.0
+// 
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Stderr, Write};
+use std::io::Write;
 use std::net::SocketAddr;
-use std::os;
 // Import necessary types from the standard library
 use std::path::{Path, PathBuf};
-use std::ptr::addr_of_mut;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
-use compress::types::types::Repository;
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use hyper::body::HttpBody;
 use hyper::{Body, StatusCode};
-use reqwest::Url;
 use ryze::hertz::{Hertz, RequestContext};
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
 
 // use crate::llm::llm;
-use crate::compress::compress::from_json;
-use utils::llm::count_tokens_rough;
+use ABCoder::compress::compress::{compress_all, from_json};
+use ABCoder::compress::conv::convert_go2rust;
+use ABCoder::compress::types::types::{Code, CodeCache, Identity};
 
-use crate::compress::golang;
-use crate::compress::parser::LanguageParser;
-use crate::storage::cache::{get_cache, CachingStorageEngine, StorageEngine};
-use crate::storage::fs::FileStorage;
-use crate::storage::memory::MemoryCache;
-use crate::storage::{cache, fs, memory};
-use crate::utils::cmd;
-use crate::utils::files;
+use ABCoder::config::{self, CONFIG};
+use ABCoder::storage::cache::{self, get_cache};
+use ABCoder::utils::cmd;
+use ABCoder::utils::files;
 // Import the git module
-use crate::utils::git;
-use crate::utils::git::RepositoryStat;
-use crate::utils::markdown;
-
-mod compress;
-mod storage;
-mod utils;
+use ABCoder::utils::git;
+use ABCoder::utils::git::RepositoryStat;
+use ABCoder::utils::markdown;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BasicInfo {
@@ -101,32 +100,6 @@ fn repo_stats(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
     .boxed()
 }
 
-fn check_repo_compress(repo: &String) -> Option<Vec<u8>> {
-    let mut cache = cache::get_cache();
-
-    cache.get(repo)
-}
-
-fn check_repo_entity(repo: &String, id: Option<&String>) -> Option<Vec<u8>> {
-    let mut cache = cache::get_cache();
-    if id.is_some() {
-        cache.get(format!("{}?{}", repo, id.unwrap()).as_str())
-    } else {
-        cache.get(repo)
-    }
-}
-
-fn set_repo_entity(repo: &String, id: Option<&String>, entity: Vec<u8>) {
-    let mut cache = cache::get_cache();
-    if id.is_some() {
-        cache
-            .put(format!("{}?{}", repo, id.unwrap()).as_str(), entity)
-            .unwrap();
-    } else {
-        cache.put(repo.as_str(), entity).unwrap();
-    }
-}
-
 fn check_repo_exist(repo: &String) -> String {
     // Url of the repository to be cloned
     let mut base_repo = repo.clone();
@@ -137,12 +110,11 @@ fn check_repo_exist(repo: &String) -> String {
     }
     let repo_url = format!("git@github.com:{}.git", base_repo);
     println!("{}", repo_url);
-    let repo_dir = format!("./tmp/{}", base_repo);
     // Directory where you want to clone the repository
-    let repo_dir_path = Path::new(repo_dir.as_str());
+    let repo_dir_path = Path::new(&CONFIG.repo_dir).join(&base_repo);
     if !repo_dir_path.exists() {
         // Call the git_clone function and handle any errors that occur
-        match git::git_clone(repo_url.as_str(), repo_dir_path) {
+        match git::git_clone(repo_url.as_str(), repo_dir_path.as_path()) {
             Ok(()) => println!("Git repo cloned successfully!"),
             Err(e) => eprintln!("An error occurred while cloning the repo: {}", e),
         }
@@ -151,8 +123,7 @@ fn check_repo_exist(repo: &String) -> String {
     }
 
     // return the real repo dir - submodule case
-    let repo_dir = format!("./tmp/{}", repo);
-    repo_dir
+    repo_dir_path.to_str().unwrap().to_string()
 }
 
 // code_analyze handler
@@ -165,21 +136,22 @@ fn code_analyze(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
     println!("repo: {}, id: {}, merge: {}", repo, id, update_ast);
     (async move {
         let repo_dir = check_repo_exist(&repo);
-        let mut repo_c = check_repo_entity(&repo, Some(&id));
+        let mut repo_c = get_concat(&repo, Some(&id));
         if update_ast || repo_c.is_none() {
-            match cmd::run_command("./go_ast", vec![repo_dir.as_str(), &id]) {
+            match cmd::run_command(&config::go_ast_path(), vec![repo_dir.as_str(), &id]) {
                 Ok(mut output) => {
                     println!("parse repo successfull, output: {}", output);
                     if repo_c.is_some() {
                         // merge
                         let mut old =
-                            from_json(String::from_utf8(repo_c.unwrap()).unwrap().as_str())
+                            from_json(&repo, String::from_utf8(repo_c.unwrap()).unwrap().as_str())
                                 .unwrap();
-                        let rep = from_json(output.as_str()).unwrap();
+                        let rep = from_json(&repo, output.as_str()).unwrap();
                         old.merge_with(&rep);
-                        old.id = format!("github.com/{}", repo);
                         output = serde_json::to_string(&old).unwrap();
-                        set_repo_entity(&repo, Some(&id), Vec::from(output.clone()));
+                        set_concat(&repo, Some(&id), Vec::from(output.clone()));
+                    } else {
+                        from_json(&repo, output.as_str()).unwrap();
                     }
                     repo_c = Some(Vec::from(output));
                 }
@@ -199,97 +171,42 @@ fn code_analyze(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
     .boxed()
 }
 
-// convert repo to csv handler
-fn repo_to_csv(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
+fn repo_go_to_rust(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
     let parsed: std::collections::HashMap<String, String> =
         serde_urlencoded::from_str(ctx.req.uri().query().unwrap()).unwrap();
     let repo = parsed.get("repo").unwrap().clone();
-    (async move {
-        match check_repo_compress(&repo) {
-            Some(re) => {
-                println!("start to convert repo: {}", repo);
-                let repo =
-                    compress::compress::from_json(String::from_utf8(re).unwrap().as_str()).unwrap();
-                // write summary to csv
-                let csv_sum = repo.to_csv_summary();
-                let path_sum = format!("./tmp_compress/{}_summary.csv", repo.id.replace("/", "_"));
-                println!("convert repo to csv: {}", path_sum);
-                let mut file = File::create(&path_sum).unwrap();
-                file.write_all(csv_sum.as_bytes()).unwrap();
-
-                // write summary to csv
-                let csv_decl = repo.to_csv_decl();
-                let path_decl = format!("./tmp_compress/{}_decl.csv", repo.id.replace("/", "_"));
-                println!("convert repo to csv: {}", path_sum);
-                let mut file = File::create(&path_decl).unwrap();
-                file.write_all(csv_decl.as_bytes()).unwrap();
-
-                // write package to csv
-                let csv_pkg = repo.to_csv_pkgs();
-                let path_pkg = format!("./tmp_compress/{}_pkg.csv", repo.id.replace("/", "_"));
-                println!("convert repo to csv: {}", path_sum);
-                let mut file = File::create(&path_pkg).unwrap();
-                file.write_all(csv_pkg.as_bytes()).unwrap();
-
-                *ctx.resp.body_mut() = "success".into();
-                return;
-            }
-            _ => {
-                println!("no repo parsed");
-                *ctx.resp.body_mut() = Body::from("convert failed.");
-            }
-        }
-    })
-    .boxed()
-}
-
-// repo_compress handler
-fn repo_compress(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
-    let parsed: std::collections::HashMap<String, String> =
-        serde_urlencoded::from_str(ctx.req.uri().query().unwrap()).unwrap();
-    let repo = parsed.get("repo").unwrap().clone();
+    println!("[repo_go2rust] repo: {}", repo);
     (async move {
         let repo_dir = check_repo_exist(&repo);
-        let repo_c = check_repo_compress(&repo);
-        let mut repo_str = String::new();
+        let mut repo_c = get(&repo);
         if repo_c.is_none() {
-            match cmd::run_command("./go_ast", vec![repo_dir.as_str()]) {
+            match cmd::run_command(
+                &config::go_ast_path(),
+                vec!["--refer_code_depth=1", repo_dir.as_str()],
+            ) {
                 Ok(output) => {
-                    println!("parse repo successfull, output: {}", output);
-                    let mut rep = from_json(output.as_str()).unwrap();
-                    rep.id = format!("github.com/{}", repo);
-                    repo_str = serde_json::to_string(&rep).unwrap();
-                    get_cache()
-                        .put(repo.as_str(), Vec::from(repo_str.clone()))
-                        .unwrap();
+                    println!("[repo_go2rust] parse repo successfull, output: {}", output);
+                    repo_c = Some(Vec::from(output));
                 }
                 Err(err) => {
                     eprint!(
-                        "plugin parse repo {} error: {}",
+                        "[repo_go2rust] plugin parse repo {} error: {:?}",
                         repo_dir.as_str(),
-                        err.to_string()
+                        err
                     );
                     *ctx.resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return;
                 }
             }
-        } else {
-            println!("load compress repo from local:{}", repo.as_str());
-            repo_str = String::from_utf8(repo_c.unwrap().clone()).unwrap();
         }
-
-        if !repo_str.is_empty() {
-            println!("start to compress repo: {}", repo);
-            let mut repo = compress::compress::from_json(repo_str.as_str()).unwrap();
-            compress::compress::compress_all(&mut repo).await;
-            let compress = serde_json::to_string(&repo).unwrap();
-            println!("compressed repo:\n{}", compress);
-
-            *ctx.resp.body_mut() = Body::from(compress);
-            return;
-        }
-
-        *ctx.resp.body_mut() = Body::from("analyze failed.");
+        let repo_c = repo_c.unwrap();
+        let mut ast = from_json(&repo, String::from_utf8(repo_c).unwrap().as_str()).unwrap();
+        let mut m = CodeCache::new(format!("go2rust_{}", ast.id));
+        m.load_from_cache();
+        let out_dir = Path::new(&CONFIG.repo_dir).join("go2rust").join(&repo);
+        convert_go2rust(&mut ast, out_dir.to_str().unwrap(), &mut m).await;
+        *ctx.resp.body_mut() = Body::from("OK");
+        return;
     })
     .boxed()
 }
@@ -301,7 +218,7 @@ fn issue_trace(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
     let repo = parsed.get("repo").unwrap().clone();
 
     (async move {
-        let mut body = String::from("please pass the key words through query key： issue");
+        let mut body = String::from("please pass the key words through query key issue");
 
         if let Some(issue_key_words) = parsed.get("issue") {
             let mut issues = git::search_issue(repo.as_str(), issue_key_words.as_str(), 3)
@@ -328,7 +245,7 @@ fn tree_structure(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
         check_repo_exist(&repo);
         let suffix = "go";
         let mut body = String::from("generate tree failed.");
-        let repo = PathBuf::from(format!("./tmp/{}", repo));
+        let repo = Path::new(&CONFIG.repo_dir).join(&repo);
         let mut tree_struct = TreeStructure {
             tree: "".to_string(),
         };
@@ -339,6 +256,31 @@ fn tree_structure(ctx: &mut RequestContext) -> BoxFuture<'_, ()> {
         *ctx.resp.body_mut() = Body::from(body);
     })
     .boxed()
+}
+
+pub fn get(key: &String) -> Option<Vec<u8>> {
+    let mut cache = cache::get_cache();
+    cache.get(key)
+}
+
+pub fn get_concat(key: &String, id: Option<&String>) -> Option<Vec<u8>> {
+    let mut cache = cache::get_cache();
+    if id.is_some() {
+        cache.get(format!("{}?{}", key, id.unwrap()).as_str())
+    } else {
+        None
+    }
+}
+
+pub fn set_concat(key: &String, id: Option<&String>, entity: Vec<u8>) {
+    let mut cache = cache::get_cache();
+    if id.is_some() {
+        cache
+            .put(format!("{}?{}", key, id.unwrap()).as_str(), entity)
+            .unwrap();
+    } else {
+        cache.put(key.as_str(), entity).unwrap();
+    }
 }
 
 // #[tokio::main]
@@ -359,8 +301,7 @@ fn main() {
         h.get("/repo_structure", Arc::new(tree_structure)).await;
         h.get("/code_analyze", Arc::new(code_analyze)).await;
 
-        h.get("/repo_compress", Arc::new(repo_compress)).await;
-        h.get("/repo_to_csv", Arc::new(repo_to_csv)).await;
+        h.get("/repo_go2rust", Arc::new(repo_go_to_rust)).await;
 
         h.spin(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 8888)))
             .await
