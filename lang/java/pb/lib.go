@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package java
+package pb
 
 import (
 	"archive/tar"
@@ -180,6 +180,10 @@ func setupJDTLS() (string, error) {
 }
 
 func GetDefaultLSP(LspOptions map[string]string) (lang uniast.Language, name string) {
+	if LspOptions["java_parser"] != "lsp" {
+		return uniast.Java, ""
+	}
+
 	return uniast.Java, generateExecuteCmd(LspOptions)
 }
 
